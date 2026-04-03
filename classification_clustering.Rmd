@@ -1,0 +1,606 @@
+---
+title: "Klasyfikacja (KDE, kNN, drzewa, RF) + analiza skupień (k-średnich, DBSCAN, EM)"
+author: "Jakub Furmanek"
+date: "`r format(Sys.Date(), '%d.%m.%Y')`"
+output:
+  html_document:
+    self_contained: true
+    theme: cerulean
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+    df_print: paged
+    highlight: tango
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(dplyr)
+
+library(MASS)
+library(fields)
+library(class)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(dbscan)
+library(mclust)
+library(cluster)
+library(fpc)
+
+set.seed(123)
+
+theme_set(theme_minimal())
+knitr::opts_chunk$set(fig.width = 8, fig.height = 5)
+
+knitr::opts_chunk$set(
+  fig.width = 8, fig.height = 5,
+  fig.align = "center",
+  dev = "png", dpi = 150
+)
+```
+
+```{r dane}
+to_num <- function(x) as.numeric(gsub(",", ".", as.character(x)))
+
+# KLASYFIKACJA: Anxiety.csv (X=t2, Y=t3, Z=group)
+anx_raw <- read.csv("Anxiety.csv", stringsAsFactors = FALSE)
+
+anx <- data.frame(
+  X = to_num(anx_raw$t2),
+  Y = to_num(anx_raw$t3),
+  Z = factor(anx_raw$group)
+)
+
+anx <- anx[complete.cases(anx), ]
+anx$Z <- droplevels(anx$Z)
+
+stopifnot(nrow(anx) > 0)
+stopifnot(nlevels(anx$Z) >= 2)
+
+summary(anx)
+table(anx$Z)
+
+# SKUPIENIA: dane27.csv (A,B)
+d27 <- read.csv("dane27.csv", stringsAsFactors = FALSE)
+stopifnot(all(c("A","B") %in% names(d27)))
+
+d27 <- d27[complete.cases(d27[, c("A","B")]), ]
+summary(d27)
+```
+
+```{r 5a}
+make_folds <- function(n, K, seed = 123) {
+  set.seed(seed)
+  idx <- sample.int(n)
+  if (K < 2) stop
+  if (K > n) stop
+  split(idx, cut(seq_along(idx), breaks = K, labels = FALSE))
+}
+
+fit_kde_by_class <- function(train_df, n_grid = 200, pad = 0.08) {
+  stopifnot(all(c("X", "Y", "Z") %in% names(train_df)))
+  train_df <- train_df[complete.cases(train_df[, c("X","Y","Z")]), , drop = FALSE]
+  train_df$Z <- droplevels(factor(train_df$Z))
+  classes <- levels(train_df$Z)
+  stopifnot(length(classes) >= 2)
+
+  rx <- range(train_df$X, na.rm = TRUE)
+  ry <- range(train_df$Y, na.rm = TRUE)
+  stopifnot(all(is.finite(c(rx, ry))))
+
+  rx <- rx + c(-1, 1) * pad * diff(rx)
+  ry <- ry + c(-1, 1) * pad * diff(ry)
+
+  models <- vector("list", length(classes))
+  names(models) <- classes
+  priors <- prop.table(table(train_df$Z))
+
+  for (cl in classes) {
+    sub <- dplyr::filter(train_df, Z == cl)
+    if (nrow(sub) < 2) stop(paste("Za mało obserwacji w klasie:", cl))
+
+    # Minimalny jitter jeśli wszystkie wartości są identyczne
+    if (length(unique(sub$X)) < 2) sub$X <- sub$X + rnorm(nrow(sub), 0, 1e-6)
+    if (length(unique(sub$Y)) < 2) sub$Y <- sub$Y + rnorm(nrow(sub), 0, 1e-6)
+
+    models[[cl]] <- MASS::kde2d(
+  x = sub$X, y = sub$Y,
+  n = n_grid,
+  lims = c(rx, ry)  # c(xmin, xmax, ymin, ymax)
+)
+  }
+
+  list(models = models, priors = priors)
+}
+
+kde_density_at <- function(kde_obj, x, y, eps = 1e-12) {
+  v <- fields::interp.surface(
+    obj = list(x = kde_obj$x, y = kde_obj$y, z = kde_obj$z),
+    loc = cbind(x, y)
+  )
+  v[is.na(v)] <- eps
+  pmax(v, eps)
+}
+
+predict_kde_classifier <- function(fit, new_df) {
+  stopifnot(all(c("X","Y") %in% names(new_df)))
+
+  classes <- names(fit$models)
+  priors <- as.numeric(fit$priors[classes])
+  names(priors) <- classes
+
+  score_list <- lapply(classes, function(cl) {
+    dens <- kde_density_at(fit$models[[cl]], new_df$X, new_df$Y)
+    log(priors[cl]) + log(dens)
+  })
+
+  score_mat <- do.call(cbind, score_list)
+  colnames(score_mat) <- classes
+
+  pred <- classes[max.col(score_mat, ties.method = "first")]
+  factor(pred, levels = classes)
+}
+
+cv_kde <- function(df, K, seed = 123, n_grid = 200) {
+  stopifnot(all(c("X","Y","Z") %in% names(df)))
+  df <- df[complete.cases(df[, c("X","Y","Z")]), , drop = FALSE]
+  df$Z <- droplevels(factor(df$Z))
+
+  n <- nrow(df)
+  folds <- make_folds(n, K = K, seed = seed)
+  pred_all <- rep(NA_character_, n)
+
+  for (k in seq_along(folds)) {
+    test_idx <- folds[[k]]
+    train_idx <- setdiff(seq_len(n), test_idx)
+
+    fit <- fit_kde_by_class(df[train_idx, , drop = FALSE], n_grid = n_grid)
+    pred_all[test_idx] <- as.character(predict_kde_classifier(fit, df[test_idx, , drop = FALSE]))
+  }
+
+  pred_all <- factor(pred_all, levels = levels(df$Z))
+  acc <- mean(pred_all == df$Z)
+
+  list(
+    accuracy = acc,
+    pred = pred_all,
+    truth = df$Z,
+    confusion = table(truth = df$Z, pred = pred_all)
+  )
+}
+
+make_grid_xy <- function(df, grid_n = 350) {
+  xg <- seq(min(df$X, na.rm = TRUE), max(df$X, na.rm = TRUE), length.out = grid_n)
+  yg <- seq(min(df$Y, na.rm = TRUE), max(df$Y, na.rm = TRUE), length.out = grid_n)
+  expand.grid(X = xg, Y = yg)
+}
+#---
+# Dopasowanie na pełnych danych do rysunku obszarów
+fit_kde_full <- fit_kde_by_class(anx, n_grid = 250)
+
+grid_xy <- make_grid_xy(anx, grid_n = 350)
+grid_xy$pred <- predict_kde_classifier(fit_kde_full, grid_xy)
+
+ggplot() +
+  geom_raster(data = grid_xy, aes(X, Y, fill = pred), alpha = 0.35) +
+  geom_point(data = anx, aes(X, Y, color = Z), size = 2) +
+  labs(title = "KDE 2D: obszary klasyfikacji",
+       fill = "Predykcja", color = "Klasa") +
+  scale_fill_brewer(palette = "Set2") +
+  scale_color_brewer(palette = "Dark2")
+
+# CV: LOOCV i 10-fold
+res_kde_loo <- cv_kde(anx, K = nrow(anx), seed = 1, n_grid = 200)
+res_kde_10  <- cv_kde(anx, K = 10,        seed = 1, n_grid = 200)
+
+res_kde_loo$accuracy
+res_kde_loo$confusion
+
+res_kde_10$accuracy
+res_kde_10$confusion
+```
+
+```{r 5b}
+plot_knn_regions <- function(df, k, grid_n = 350) {
+  grid_xy <- make_grid_xy(df, grid_n = grid_n)
+
+  pred <- class::knn(
+    train = as.matrix(df[, c("X","Y")]),
+    test  = as.matrix(grid_xy[, c("X","Y")]),
+    cl = df$Z,
+    k = k
+  )
+  grid_xy$pred <- pred
+
+  ggplot() +
+    geom_raster(data = grid_xy, aes(X, Y, fill = pred), alpha = 0.35) +
+    geom_point(data = df, aes(X, Y, color = Z), size = 2) +
+    labs(title = paste0("kNN: obszary klasyfikacji (k = ", k, ")"),
+         fill = "Predykcja", color = "Klasa") +
+    scale_fill_brewer(palette = "Set2") +
+    scale_color_brewer(palette = "Dark2")
+}
+
+# Kilka przykładowych k (wizualnie)
+plot_knn_regions(anx, k = 1)
+plot_knn_regions(anx, k = 3)
+plot_knn_regions(anx, k = 5)
+plot_knn_regions(anx, k = 9)
+
+# Kandydaci k (nieparzyste; ograniczamy do rozsądnego zakresu)
+k_values <- sort(unique(c(1, 3, 5, 7, 9, 11, 15, 19)))
+
+# LOOCV: class::knn.cv
+acc_knn_loo <- sapply(k_values, function(k) {
+  pred <- class::knn.cv(
+    train = as.matrix(anx[, c("X","Y")]),
+    cl = anx$Z,
+    k = k
+  )
+  mean(pred == anx$Z)
+})
+
+# 10-fold: caret::train (Jedno dopasowanie dla całej siatki)
+set.seed(123)
+ctrl10 <- trainControl(method = "cv", number = 10)
+fit_knn_10 <- caret::train(
+  Z ~ X + Y,
+  data = anx,
+  method = "knn",
+  tuneGrid = data.frame(k = k_values),
+  trControl = ctrl10
+)
+
+acc_knn_10 <- fit_knn_10$results$Accuracy
+names(acc_knn_10) <- fit_knn_10$results$k
+
+knn_table <- data.frame(
+  k = k_values,
+  acc_LOOCV = as.numeric(acc_knn_loo),
+  acc_CV10 = as.numeric(acc_knn_10[as.character(k_values)])
+)
+
+knn_table
+
+best_k_10 <- knn_table$k[which.max(knn_table$acc_CV10)]
+best_k_10
+```
+
+```{r 5c}
+# --- Drzewo (rpart) ---
+set.seed(123)
+fit_tree_10 <- caret::train(
+  Z ~ X + Y,
+  data = anx,
+  method = "rpart",
+  trControl = trainControl(method = "cv", number = 10),
+  tuneLength = 30
+)
+fit_tree_10
+best_tree_10_acc <- max(fit_tree_10$results$Accuracy)
+
+set.seed(123)
+fit_tree_loo <- caret::train(
+  Z ~ X + Y,
+  data = anx,
+  method = "rpart",
+  trControl = trainControl(method = "LOOCV"),
+  tuneLength = 30
+)
+fit_tree_loo
+best_tree_loo_acc <- max(fit_tree_loo$results$Accuracy)
+
+rpart.plot::rpart.plot(
+  fit_tree_10$finalModel,
+  main = "Najlepsze drzewo (wg 10-fold CV)"
+)
+
+grid_xy <- make_grid_xy(anx, grid_n = 350)
+grid_xy$pred <- predict(fit_tree_10, newdata = grid_xy)
+
+ggplot() +
+  geom_raster(data = grid_xy, aes(X, Y, fill = pred), alpha = 0.35) +
+  geom_point(data = anx, aes(X, Y, color = Z), size = 2) +
+  labs(title = "Drzewo klasyfikacyjne: obszary klasyfikacji",
+       fill = "Predykcja", color = "Klasa") +
+  scale_fill_brewer(palette = "Set2") +
+  scale_color_brewer(palette = "Dark2")
+
+# --- Random Forest ---
+set.seed(123)
+fit_rf_10 <- caret::train(
+  Z ~ X + Y,
+  data = anx,
+  method = "rf",
+  trControl = trainControl(method = "cv", number = 10),
+  tuneLength = 10,
+  importance = TRUE
+)
+fit_rf_10
+best_rf_10_acc <- max(fit_rf_10$results$Accuracy)
+
+# LOOCV może być wolniejsze; zostawiamy, bo dane zwykle są małe
+set.seed(123)
+fit_rf_loo <- caret::train(
+  Z ~ X + Y,
+  data = anx,
+  method = "rf",
+  trControl = trainControl(method = "LOOCV"),
+  tuneLength = 10,
+  importance = TRUE
+)
+fit_rf_loo
+best_rf_loo_acc <- max(fit_rf_loo$results$Accuracy)
+
+grid_xy <- make_grid_xy(anx, grid_n = 350)
+grid_xy$pred <- predict(fit_rf_10, newdata = grid_xy)
+
+ggplot() +
+  geom_raster(data = grid_xy, aes(X, Y, fill = pred), alpha = 0.35) +
+  geom_point(data = anx, aes(X, Y, color = Z), size = 2) +
+  labs(title = "Random Forest: obszary klasyfikacji",
+       fill = "Predykcja", color = "Klasa") +
+  scale_fill_brewer(palette = "Set2") +
+  scale_color_brewer(palette = "Dark2")
+#---
+# KDE
+acc_kde_loo <- res_kde_loo$accuracy
+acc_kde_10  <- res_kde_10$accuracy
+
+# kNN: najlepsze wg CV10 oraz odpowiadające LOOCV
+acc_knn_best_10  <- max(knn_table$acc_CV10)
+acc_knn_best_loo <- knn_table$acc_LOOCV[which.max(knn_table$acc_CV10)]
+k_best <- best_k_10
+
+# Drzewo / RF
+acc_tree_10  <- best_tree_10_acc
+acc_tree_loo <- best_tree_loo_acc
+acc_rf_10    <- best_rf_10_acc
+acc_rf_loo   <- best_rf_loo_acc
+
+compare_table <- tibble::tibble(
+  Metoda = c("KDE", paste0("kNN, k=", k_best), "Drzewo", "Random Forest"),
+  LOOCV = 100 * c(acc_kde_loo, acc_knn_best_loo, acc_tree_loo, acc_rf_loo),
+  CV10  = 100 * c(acc_kde_10,  acc_knn_best_10,  acc_tree_10,  acc_rf_10)
+)
+
+compare_table
+
+best_cv10 <- compare_table %>% slice_max(CV10, n = 1, with_ties = FALSE)
+best_loo  <- compare_table %>% slice_max(LOOCV, n = 1, with_ties = FALSE)
+
+best_cv10
+best_loo
+
+cat("### Wnioski (klasyfikacja)\n\n")
+cat(
+  "- Najwyższą skuteczność w 10-fold CV uzyskała metoda: **",
+  best_cv10$Metoda,
+  "** (",
+  sprintf("%.2f%%", best_cv10$CV10),
+  ").\n",
+  sep = ""
+)
+cat(
+  "- Najwyższą skuteczność w LOOCV uzyskała metoda: **",
+  best_loo$Metoda,
+  "** (",
+  sprintf("%.2f%%", best_loo$LOOCV),
+  ").\n",
+  sep = ""
+)
+cat(
+  "- Jako model rekomendowany do uogólniania przyjmujemy wynik 10-fold CV (mniejsza wariancja niż LOOCV), więc w praktyce wygrywa: **",
+  best_cv10$Metoda,
+  "**.\n\n",
+  sep = ""
+)
+```
+
+```{r 5d}
+X <- scale(d27[, c("A","B")])  # standaryzacja
+X_mat <- as.matrix(X)
+stopifnot(ncol(X_mat) == 2, nrow(X_mat) >= 2)
+
+D <- dist(X_mat)
+
+# Elbow: WSS dla k=1..10
+set.seed(123)
+wss <- sapply(1:10, function(k) kmeans(X_mat, centers = k, nstart = 50)$tot.withinss)
+wss_df <- data.frame(k = 1:10, tot_withinss = wss)
+
+# Automatyczny wybór k metodą "max distance to line"
+choose_k_elbow <- function(wss_vec) {
+  ks <- seq_along(wss_vec)
+
+  x1 <- ks[1]; y1 <- wss_vec[1]
+  x2 <- ks[length(ks)]; y2 <- wss_vec[length(ks)]
+
+  dist_point_line <- function(x0, y0) {
+    abs((y2 - y1) * x0 - (x2 - x1) * y0 + x2*y1 - y2*x1) /
+      sqrt((y2 - y1)^2 + (x2 - x1)^2)
+  }
+
+  dists <- mapply(dist_point_line, ks, wss_vec)
+  dists[1] <- -Inf
+  as.integer(ks[which.max(dists)])
+}
+
+k_sel <- choose_k_elbow(wss)
+stopifnot(is.numeric(k_sel), length(k_sel) == 1, is.finite(k_sel))
+k_sel <- as.integer(k_sel)
+stopifnot(k_sel >= 2, k_sel <= length(wss))
+
+k_sel
+
+ggplot(wss_df, aes(k, tot_withinss)) +
+  geom_line() + geom_point(size = 2) +
+  geom_vline(xintercept = k_sel, linetype = 2) +
+  labs(
+    title = paste0("Wybór liczby klastrów (elbow), wybrane k = ", k_sel),
+    x = "k", y = "Total withinss"
+  )
+
+# k-means
+set.seed(123)
+km <- kmeans(X_mat, centers = k_sel, nstart = 50)
+
+d27_km <- d27 %>% mutate(cluster = factor(km$cluster))
+ggplot(d27_km, aes(A, B, color = cluster)) +
+  geom_point(size = 2) +
+  labs(title = paste0("k-means: k = ", k_sel), color = "Klaster")
+
+cs_km <- fpc::cluster.stats(d = D, clustering = km$cluster)
+cs_km$avg.silwidth
+cs_km$dunn
+
+# ---
+# DBSCAN: strojenie eps po siatce kwantyli odległości k-tego sąsiada
+minPts <- 4
+knnd <- dbscan::kNNdist(X_mat, k = minPts)
+
+eps_grid <- as.numeric(quantile(knnd, probs = seq(0.80, 0.98, by = 0.02), na.rm = TRUE))
+eps_grid <- sort(unique(eps_grid))
+
+dbscan_score_one <- function(eps, data_mat, minPts) {
+  data_mat <- as.matrix(data_mat)
+  db <- dbscan::dbscan(data_mat, eps = eps, minPts = minPts)
+  keep <- db$cluster != 0
+
+  if (sum(keep) <= 2) return(list(ok = FALSE))
+  if (length(unique(db$cluster[keep])) <= 1) return(list(ok = FALSE))
+
+  cs <- fpc::cluster.stats(
+    d = dist(data_mat[keep, , drop = FALSE]),
+    clustering = db$cluster[keep]
+  )
+
+  list(
+    ok = TRUE,
+    eps = eps,
+    n_noise = sum(!keep),
+    n_clusters = length(unique(db$cluster[keep])),
+    sil = cs$avg.silwidth,
+    dunn = cs$dunn,
+    clustering = db$cluster,
+    cs = cs
+  )
+}
+
+db_res <- lapply(eps_grid, FUN = dbscan_score_one, data_mat = X_mat, minPts = minPts)
+db_ok <- Filter(function(x) isTRUE(x$ok), db_res)
+
+db_tune <- if (length(db_ok) > 0) {
+  data.frame(
+    eps = sapply(db_ok, `[[`, "eps"),
+    n_noise = sapply(db_ok, `[[`, "n_noise"),
+    n_clusters = sapply(db_ok, `[[`, "n_clusters"),
+    avg_sil = sapply(db_ok, `[[`, "sil"),
+    dunn = sapply(db_ok, `[[`, "dunn")
+  )
+} else {
+  data.frame()
+}
+
+db_tune
+
+if (nrow(db_tune) > 0) {
+  best_row <- db_tune %>%
+    arrange(desc(avg_sil), n_noise) %>%
+    slice(1)
+  eps_best <- best_row$eps
+} else {
+  eps_best <- as.numeric(quantile(knnd, 0.95, na.rm = TRUE))
+}
+
+stopifnot(is.numeric(eps_best), length(eps_best) == 1, is.finite(eps_best))
+eps_best
+
+db_best <- dbscan::dbscan(X_mat, eps = eps_best, minPts = minPts)
+table(db_best$cluster)  # 0 = noise
+
+d27_db <- d27 %>% mutate(cluster = factor(db_best$cluster))
+ggplot(d27_db, aes(A, B, color = cluster)) +
+  geom_point(size = 2) +
+  labs(
+    title = paste0("DBSCAN: eps=", round(eps_best, 3), ", minPts=", minPts, " (0 = noise)"),
+    color = "Klaster"
+  )
+
+keep <- db_best$cluster != 0
+if (sum(keep) > 2 && length(unique(db_best$cluster[keep])) > 1) {
+  cs_db <- fpc::cluster.stats(
+    d = dist(X_mat[keep, , drop = FALSE]),
+    clustering = db_best$cluster[keep]
+  )
+  cs_db$avg.silwidth
+  cs_db$dunn
+} else {
+  cs_db <- NULL
+  NA
+}
+
+# ---
+# EM (mclust): dobór liczby klastrów po BIC
+mc <- mclust::Mclust(X_mat)
+mc
+
+d27_mc <- d27 %>% mutate(cluster = factor(mc$classification))
+ggplot(d27_mc, aes(A, B, color = cluster)) +
+  geom_point(size = 2) +
+  labs(
+    title = paste0("EM (mclust): liczba klastrów = ", mc$G),
+    color = "Klaster"
+  )
+
+cs_mc <- fpc::cluster.stats(d = D, clustering = mc$classification)
+cs_mc$avg.silwidth
+cs_mc$dunn
+```
+
+```{r 5e}
+quality_table <- tibble::tibble(
+  Metoda = c("k-means", "DBSCAN (bez noise)", "EM (mclust)"),
+  Avg_Silhouette = c(
+    cs_km$avg.silwidth,
+    if (!is.null(cs_db)) cs_db$avg.silwidth else NA_real_,
+    cs_mc$avg.silwidth
+  ),
+  Dunn = c(
+    cs_km$dunn,
+    if (!is.null(cs_db)) cs_db$dunn else NA_real_,
+    cs_mc$dunn
+  )
+)
+
+quality_table
+
+best_sil <- quality_table %>% filter(!is.na(Avg_Silhouette)) %>% slice_max(Avg_Silhouette, n = 1, with_ties = FALSE)
+best_dunn <- quality_table %>% filter(!is.na(Dunn)) %>% slice_max(Dunn, n = 1, with_ties = FALSE)
+
+best_sil
+best_dunn
+#---
+cat("### Wnioski (skupienia)\n\n")
+cat(
+  "- Wg średniej szerokości sylwetki (silhouette) najlepsza jest metoda: **",
+  best_sil$Metoda,
+  "** (",
+  sprintf("%.4f", best_sil$Avg_Silhouette),
+  ").\n",
+  sep = ""
+)
+cat(
+  "- Wg indeksu Dunna najlepsza jest metoda: **",
+  best_dunn$Metoda,
+  "** (",
+  sprintf("%.4f", best_dunn$Dunn),
+  ").\n",
+  sep = ""
+)
+cat(
+  "- DBSCAN oceniam bez punktów noise (klaster 0), bo tylko wtedy silhouette/Dunn opisują realne klastry zamiast mieszać je ze „szumem”.\n\n"
+)
+```
